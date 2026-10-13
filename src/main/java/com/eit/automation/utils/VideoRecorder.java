@@ -10,6 +10,7 @@ import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -22,11 +23,18 @@ public class VideoRecorder {
     private volatile boolean isRecording = false;
     private SeekableByteChannel out; // Resource management channel
 
+    // Dedicated single-thread background pool for non-blocking file writing & compression
+    private static final ExecutorService backgroundSaver = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "Video-Background-Saver");
+        t.setDaemon(true);
+        return t;
+    });
+
     // Target dimensions: 1024x576 (Ultra-lightweight HD format, perfect for Selenium UI steps)
     private static final int TARGET_WIDTH = 1024;
     private static final int TARGET_HEIGHT = 576;
 
-    // Frame capture rate: 250 ms = 4 FPS (Cuts raw file size by more than half)
+    // Frame capture rate: 250 ms = 4 FPS
     private static final int CAPTURE_INTERVAL_MS = 250;
 
     /**
@@ -43,7 +51,7 @@ public class VideoRecorder {
     /**
      * Initializes and starts a new MP4 recording session.
      */
-    public void startRecording(String directory, String fileName) throws Exception {
+    public synchronized void startRecording(String directory, String fileName) throws Exception {
         // Force .mp4 extension
         if (!fileName.toLowerCase().endsWith(".mp4")) {
             fileName = fileName.replaceAll("\\.[^.]+$", "") + ".mp4";
@@ -55,13 +63,13 @@ public class VideoRecorder {
         this.videoFile = new File(dir, fileName);
         this.out = NIOUtils.writableChannel(videoFile);
 
-        // Rational.R(4, 1) = 4 FPS (Ultra low overhead, perfectly smooth for UI text)
+        // Rational.R(8, 1) = 4 FPS (Ultra low overhead, perfectly smooth for UI text)
         this.encoder = new AWTSequenceEncoder(out, Rational.R(8, 1));
         this.isRecording = true;
 
         // Use Daemon Thread so background recording won't hang JVM on failure
         worker = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r);
+            Thread t = new Thread(r, "Video-Capture-Worker");
             t.setDaemon(true);
             return t;
         });
@@ -130,59 +138,67 @@ public class VideoRecorder {
     }
 
     /**
-     * Stops recording, finalizes JCodec MP4, attempts FFmpeg compression if available,
-     * registers the artifact for Cloudinary upload, and returns the path.
+     * Stops recording cleanly without corrupting frames, offloading finalization
+     * to the background thread pool so test execution never blocks.
      */
-    public String stopRecording(String videoKey) throws Exception {
+    public synchronized String stopRecording(String videoKey) throws Exception {
         this.isRecording = false;
 
         if (worker != null) {
-            worker.shutdown();
+            worker.shutdown(); // Graceful shutdown (allows active frame capture to finish cleanly)
             try {
-                if (!worker.awaitTermination(2, TimeUnit.SECONDS)) {
+                if (!worker.awaitTermination(1, TimeUnit.SECONDS)) {
                     worker.shutdownNow();
                 }
             } catch (InterruptedException e) {
                 worker.shutdownNow();
                 Thread.currentThread().interrupt();
             }
+            worker = null;
         }
 
-        // Finalize JCodec MP4 header and close channel safely
-        synchronized (this) {
-            if (encoder != null) {
-                try {
-                    encoder.finish();
-                } catch (Exception e) {
-                    System.err.println("⚠️ Warning during encoder finish: " + e.getMessage());
+        // Capture local references for the background thread
+        final AWTSequenceEncoder localEncoder = this.encoder;
+        final SeekableByteChannel localOut = this.out;
+        final File localVideoFile = this.videoFile;
+
+        // Reset current pointers immediately so the next test can start clean
+        this.encoder = null;
+        this.out = null;
+
+        String savedFilePath = (localVideoFile != null) ? localVideoFile.getAbsolutePath() : "";
+
+        // Offload safe encoding finalization and compression to background thread pool
+        backgroundSaver.submit(() -> {
+            try {
+                if (localEncoder != null) {
+                    localEncoder.finish();
                 }
-                encoder = null;
+            } catch (Exception e) {
+                System.err.println("⚠️ Warning during background encoder finish: " + e.getMessage());
             }
-            if (out != null) {
-                try {
-                    out.close();
-                } catch (IOException e) {
-                    System.err.println("⚠️ Warning closing channel: " + e.getMessage());
+
+            try {
+                if (localOut != null) {
+                    localOut.close();
                 }
-                out = null;
+            } catch (IOException e) {
+                System.err.println("⚠️ Warning closing channel in background: " + e.getMessage());
             }
-        }
 
-        String savedFilePath = (videoFile != null && videoFile.exists()) ? videoFile.getAbsolutePath() : "";
+            if (localVideoFile != null && localVideoFile.exists() && localVideoFile.length() > 0) {
+                String currentPath = localVideoFile.getAbsolutePath();
+                currentPath = compressWithFFmpegIfAvailable(currentPath);
 
-        if (!savedFilePath.isEmpty()) {
-            // Optional FFmpeg post-compression check (If FFmpeg is on machine PATH)
-            savedFilePath = compressWithFFmpegIfAvailable(savedFilePath);
+                File finalFile = new File(currentPath);
+                System.out.println("✅ Background MP4 Saved (" + (finalFile.length() / (1024 * 1024)) + " MB): " + currentPath);
 
-            File finalFile = new File(savedFilePath);
-            System.out.println("✅ Final MP4 Video saved locally (" + (finalFile.length() / (1024 * 1024)) + " MB): " + savedFilePath);
-
-            String cleanKey = (videoKey != null && !videoKey.trim().isEmpty()) ? new File(videoKey).getName() : finalFile.getName();
-
-            ScreenshotHelper.registerArtifact(cleanKey, savedFilePath);
-        } else {
-            System.err.println("⚠️ Video file was not created properly!");
-        }
+                String cleanKey = (videoKey != null && !videoKey.trim().isEmpty()) ? new File(videoKey).getName() : finalFile.getName();
+                ScreenshotHelper.registerArtifact(cleanKey, currentPath);
+            } else {
+                System.err.println("⚠️ Video file was not created properly or is empty!");
+            }
+        });
 
         return savedFilePath;
     }
@@ -193,7 +209,6 @@ public class VideoRecorder {
     private String compressWithFFmpegIfAvailable(String inputPath) {
         String compressedPath = inputPath.replace(".mp4", "_compressed.mp4");
 
-        // Command: ffmpeg -y -i input.mp4 -vcodec libx264 -crf 28 compressed.mp4
         ProcessBuilder pb = new ProcessBuilder(
                 "ffmpeg", "-y", "-i", inputPath,
                 "-vcodec", "libx264",
@@ -216,9 +231,7 @@ public class VideoRecorder {
                     return compressedPath;
                 }
             }
-        } catch (Exception e) {
-            // FFmpeg not installed or timeout occurred; silently fall back to optimized JCodec output
-        }
+        } catch (Exception ignored) {}
 
         return inputPath;
     }
@@ -234,5 +247,23 @@ public class VideoRecorder {
 
     public boolean isRecording() {
         return isRecording;
+    }
+
+    public static void shutdownBackgroundSaver() {
+        backgroundSaver.shutdown();
+    }
+
+    /**
+     * Waits for all pending background video saving/uploading tasks to finish.
+     */
+    public static void waitForCompletion() {
+        backgroundSaver.shutdown();
+        try {
+            if (!backgroundSaver.awaitTermination(60, TimeUnit.SECONDS)) {
+                System.err.println("⚠️ Warning: Background video saver timed out waiting for queue to clear.");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 }

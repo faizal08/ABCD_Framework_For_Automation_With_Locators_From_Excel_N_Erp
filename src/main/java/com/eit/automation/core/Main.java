@@ -170,6 +170,10 @@ public class Main {
 
             reportGenerator.endTestExecution();
 
+            // 🛑 CRITICAL FIX: Wait for background video queue to drain BEFORE collecting artifacts for Cloudinary
+            System.out.println("\n⏳ Waiting for background video worker queue to finish saving final test case...");
+            VideoRecorder.waitForCompletion();
+
             // ==========================================
             // 3. POST-SUITE ARTIFACT PROCESSING
             // ==========================================
